@@ -1,0 +1,17 @@
+# Google-owned binaries/models and derived databases: never commit or redistribute.
+re/
+*.tflite
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+# Test recordings and libsoda's responses to them (tests/README.md): local only.
+tests/data/
+# Local tooling
+.DS_Store
+__pycache__/
+.venv/
+third_party/
+build/
