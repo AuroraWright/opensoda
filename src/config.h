@@ -61,6 +61,10 @@ struct DecoderConfig {
   // FstDecoderParams.enable_resume_search: a new segment continues from the
   // previous one's decoder context instead of from <s> (CONTINUOUS sets it).
   bool resume_search = false;
+  // FstDecoderParams.ignored_resume_context_suffix: a symbol a resumed
+  // search drops from the end of its context (the en-US SHORT configs name
+  // </S> but leave resume off).
+  std::string ignored_resume_context_suffix;
   float smoothing_temperature = 1.0f;
   float internal_lm_smoothing_temperature = 1.0f;
   float internal_lm_cost_scale = 0.0f;

@@ -212,6 +212,7 @@ void ParseDecoderParams(std::string_view m, DecoderConfig* d,
     ProtoReader f(fst);
     while (f.Next()) {
       if (f.field() == 24) d->resume_search = f.boolean();  // enable_resume_search
+      if (f.field() == 38) d->ignored_resume_context_suffix = f.str();
     }
   }
   std::string_view pie = FindExtension(m, kPieRnnFstDecoderParams);

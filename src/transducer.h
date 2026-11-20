@@ -177,8 +177,9 @@ class BeamSearch {
   // Starts a new segment from <S>.
   void Reset();
   // Starts a new segment that keeps the best hypothesis's decoder context
-  // (its last two labels) but none of its labels.
-  void Resume();
+  // (its last two labels) but none of its labels. A context ending in
+  // `ignored_suffix` resumes from the context before it.
+  void Resume(int ignored_suffix = -1);
   void Advance(const std::vector<float>& encoder_frame);
   // Adds the biaser's costs to labels (null: none). It must outlive the
   // search.
@@ -206,6 +207,7 @@ class BeamSearch {
   DecoderConfig config_;
   const ContextBiaser* biaser_ = nullptr;
   std::vector<Hypothesis> beam_;
+  Hypothesis start_;  // The context the segment started from.
   // The costs of the label sequences the previous frame ended with, before
   // pruning.
   struct Ended {

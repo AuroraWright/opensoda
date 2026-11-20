@@ -143,6 +143,11 @@ bool Recognizer::Init(const RecognizerOptions& options, std::string* error) {
       !symbols_.Load(models + "/" + config_.symbols_file, error)) {
     return false;
   }
+  const std::string& suffix = config_.decoder.ignored_resume_context_suffix;
+  if (!suffix.empty() && (resume_suffix_ = symbols_.Find(suffix)) < 0) {
+    *error = "Unknown ignored_resume_context_suffix: '" + suffix + "'";
+    return false;
+  }
   cascade_ = !config_.cascade.encoder.file.empty();
   if (cascade_ &&
       (!cascade_encoder_.Init(models + "/" + config_.cascade.encoder.file, options.num_threads, error) ||
@@ -1437,7 +1442,7 @@ void Recognizer::EmitFinal(bool end_of_audio, bool segment_end) {
   // against libsoda on the lesson recording: 19% vs 27% with the decoder
   // context kept).
   if (config_.decoder.resume_search && !end_of_audio && !segment_end) {
-    search_->Resume();
+    search_->Resume(resume_suffix_);
   } else {
     search_->Reset();
   }

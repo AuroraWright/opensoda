@@ -327,6 +327,7 @@ void BeamSearch::Reset() {
   Hypothesis h;
   h.prev_label = config_.decoder_initial_value;
   h.last_label = config_.sos_id;
+  start_ = h;
   beam_.assign(1, h);
   ended_.clear();
   best_ = 0;
@@ -334,12 +335,21 @@ void BeamSearch::Reset() {
   frame_ = 0;
 }
 
-void BeamSearch::Resume() {
+void BeamSearch::Resume(int ignored_suffix) {
   Hypothesis h;
   const Hypothesis& best = Best();
-  h.prev_label = best.prev_label;
-  h.last_label = best.last_label;
-  h.decoder_state = best.decoder_state;
+  const std::vector<int>& l = best.labels;
+  const size_t n = l.size();
+  if (ignored_suffix >= 0 && n > 0 && l.back() == ignored_suffix) {
+    h.last_label = n >= 2 ? l[n - 2] : start_.last_label;
+    h.prev_label = n >= 3 ? l[n - 3] : n == 2 ? start_.last_label : start_.prev_label;
+    h.decoder_state = best.parent_state;
+  } else {
+    h.prev_label = best.prev_label;
+    h.last_label = best.last_label;
+    h.decoder_state = best.decoder_state;
+  }
+  start_ = h;
   beam_.assign(1, h);
   ended_.clear();
   best_ = 0;
@@ -445,7 +455,10 @@ void BeamSearch::Advance(const std::vector<float>& encoder_frame) {
           extensions.push_back(&g);
         }
       }
-      if (config_.eos_id > 0 && h.last_label == config_.eos_id) continue;  // Ended.
+      // Ended. A resumed search keeps </S> as decoder context only (libsoda
+      // drops it from the context when ignored_resume_context_suffix names
+      // it), so it is judged by the hypothesis's own labels.
+      if (config_.eos_id > 0 && !h.labels.empty() && h.labels.back() == config_.eos_id) continue;
       for (int k = 1; k < vocab; ++k) {
         float cost = c[k];
         if (k == config_.sos_id) continue;

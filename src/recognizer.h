@@ -287,6 +287,7 @@ class Recognizer {
   JointNetwork joint_;
   SymbolTable symbols_;
   std::unique_ptr<BeamSearch> search_;
+  int resume_suffix_ = -1;  // ignored_resume_context_suffix's id.
   // The cascaded second pass (en-US): a non-causal encoder over the first
   // pass's encoder output, with its own decoder, which gives the finals.
   bool cascade_ = false;
