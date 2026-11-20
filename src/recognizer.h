@@ -62,6 +62,12 @@ struct RecognizerOptions {
   // Identify the spoken language with the pack's LANGUAGE_IDENTIFICATION
   // pipeline, reporting it through the language callback.
   bool enable_language_id = false;
+  // Keep up with live audio as libsoda does: when recognition restarts after
+  // a final with more than this much audio received but not yet recognized
+  // (counting the caller's queued audio, see set_queued_audio_callback), it
+  // skips to the last max_backlog_ms of it. libsoda keeps 1000 ms, or 5000 ms
+  // with a multilang config. 0 recognizes all the audio, however late.
+  int max_backlog_ms = 0;
   // Phrases to bias recognition toward, with their boosts (packs with a
   // class_substitution_twiddler context model, such as en-US; others ignore
   // them).
@@ -140,6 +146,9 @@ class Recognizer {
   }
   // Receives language identification events when enabled.
   void set_language_callback(LanguageIdentifier::Callback cb);
+  // Returns how much audio, in sample frames at the input rate, the caller
+  // has received but not yet passed to AddAudio (for max_backlog_ms).
+  void set_queued_audio_callback(std::function<int64_t()> cb) { queued_audio_ = std::move(cb); }
   // Receives every encoder input frame (normalized features), for debugging.
   void set_feature_tap(std::function<void(const std::vector<float>&)> tap) {
     feature_tap_ = std::move(tap);
@@ -316,6 +325,8 @@ class Recognizer {
   int64_t history_start_ = 0;  // Sample index of history_[0].
   int64_t origin_ = 0;         // Sample index where the pipeline (re)started.
   int64_t restart_at_ = -1;    // Sample index to restart at, or -1.
+  int64_t skip_to_ = 0;        // Audio before this sample index is not recognized.
+  std::function<int64_t()> queued_audio_;
 
   // Resampler state (input rate -> 16 kHz).
   double resample_ratio_ = 1.0;

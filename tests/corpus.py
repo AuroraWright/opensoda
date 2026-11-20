@@ -19,9 +19,17 @@ text, the hypothesis Chrome's captions use; raw text; start and end), `text` and
 library defaults to build/libsoda.dylib, unpaced. Google's libsoda must be
 paced: Chrome feeds it in real time (the default for any other library,
 --speed 1); fed faster, its encoder batches frames differently and its
-results change (and it skips audio when it falls 30 s behind). On 43
-Japanese clips, libsoda at --speed 2 and 4 gave its real-time results, at
-8 not. -j runs N processes, each over a contiguous share of the clips.
+results change. On 43 Japanese clips, libsoda at --speed 2 and 4 gave its
+real-time results, at 8 not. -j runs N processes, each over a contiguous
+share of the clips.
+
+Fed faster than they recognize, both libraries skip audio to keep up, as
+with live audio: a recognition session (each final starts one) that finds
+more than 1 s (5 s with Chrome's multilang config) of audio waiting drops
+all but that much. Unpaced, `run` therefore sets the config's
+simulate_realtime_testonly (soda_api_client --simulate-realtime): opensoda
+then recognizes all the audio as fast as it can, and Google's libsoda reads
+it at real-time speed.
 
 Google's libsoda sometimes never finishes a clip: when its search ends a
 segment without a result ("No final state active" in its log), it loops
@@ -123,6 +131,8 @@ def run(args):
     start = time.time()
     base = [CLIENT, library, pack, "--speed", str(speed), "--chunk-ms", str(args.chunk_ms),
             "--clip-timeout", str(args.clip_timeout)]
+    if speed == 0:
+        base.append("--simulate-realtime")
     if args.ime:
         base.append("--ime")
 

@@ -6,9 +6,10 @@
 Runs soda_api_client on the en (55 s), ja (122 s) and pl (15 s) regression
 recordings, one at a time, with build/libsoda.dylib and, if given, a
 reference library such as Chrome's libsoda. Offline, opensoda runs
-unpaced and the reference at --reference-speed (default 8: libsoda keeps
-only 30 s of audio and skips ahead when fed faster than it keeps up);
-with --realtime both are fed at real-time speed, as in Live Caption.
+unpaced (simulating real time, so that it recognizes all the audio) and
+the reference at --reference-speed (default 8; libsoda reads simulated
+real-time audio at real-time speed); with --realtime both are fed at
+real-time speed, as in Live Caption.
 """
 
 import argparse
@@ -52,7 +53,8 @@ def main():
             continue
         wav = os.path.join(DATA, recording, "audio.wav")
         for label, lib, speed in libs:
-            print("%s %-9s %s" % (name, label, measure([client, lib, pack, wav, "--speed", str(speed)])),
+            cmd = [client, lib, pack, wav, "--speed", str(speed)] + (["--simulate-realtime"] if speed == 0 else [])
+            print("%s %-9s %s" % (name, label, measure(cmd)),
                   flush=True)
     return 0
 

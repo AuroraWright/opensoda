@@ -2,14 +2,18 @@
 //
 // Usage: soda_api_client LIBRARY PACK_DIR file.wav... [--clips LIST] [--jsonl F]
 //                        [--dump-dir D] [--ime] [--realtime]
-//                        [--speed X] [--chunk-ms N] [--multilang LOCALE=DIR]...
+//                        [--speed X] [--simulate-realtime] [--chunk-ms N] [--multilang LOCALE=DIR]...
 //                        [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]...
 //                        [--config-file F] [--update-context] [--context-name NAME]
 //
 // --realtime paces the audio like a live microphone; --speed X paces it X
-// times faster. Google's libsoda keeps only 30 s of audio history and skips
-// ahead when it falls behind, so it needs pacing. --chunk-ms sets how much
-// audio each AddAudio call carries.
+// times faster. Unpaced, the libraries skip audio to keep up as with a live
+// microphone: when recognition starts after a final with more than 1 s (5 s
+// with the multilang config Chrome sends) of audio waiting, all but that
+// much is dropped. --simulate-realtime sets the config's
+// simulate_realtime_testonly: Google's libsoda then reads the audio at
+// real-time speed itself, and opensoda recognizes all of it as fast as it
+// can. --chunk-ms sets how much audio each AddAudio call carries.
 //
 // Several clips (as arguments, or listed one per line in --clips LIST, where
 // anything after a tab is ignored) are recognized the way Chrome captions
@@ -239,6 +243,7 @@ void AppendJsonString(std::string* out, const std::string& s) {
 struct Options {
   std::string pack;
   bool ime = false, format = true, mask = false, update_context = false, verbose = false;
+  bool simulate_realtime = false;
   double speed = 0;  // 0: as fast as possible.
   double clip_timeout_s = 30;  // After the audio is fed; 0: none.
   int chunk_ms = 100;
@@ -254,11 +259,12 @@ std::string BuildConfig(const Options& o, int rate, int channels, std::string* c
   cfg.Varint(1, channels);
   cfg.Varint(2, rate);
   cfg.Bytes(6, o.api_key);
+  if (o.simulate_realtime) cfg.Bool(5, true);  // simulate_realtime_testonly
   if (!o.saved_config.empty()) {
-    soda::ProtoReader r(o.saved_config);  // Re-serialize all fields but 1, 2 and 6.
+    soda::ProtoReader r(o.saved_config);  // All fields but 1, 2 and 6 (and 5, set above).
     while (r.Next()) {
       const uint32_t f = r.field();
-      if (f == 1 || f == 2 || f == 6) continue;
+      if (f == 1 || f == 2 || f == 6 || (f == 5 && o.simulate_realtime)) continue;
       if (r.wire_type() == 0) {
         cfg.Varint(f, r.varint());
       } else {
@@ -398,7 +404,7 @@ class Watchdog {
 
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::fprintf(stderr, "usage: %s LIBRARY PACK_DIR file.wav... [--clips LIST] [--jsonl F] [--dump-dir D] [--verbose] [--ime] [--realtime] [--speed X] [--chunk-ms N] [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]... [--update-context] [--context-name NAME] [--multilang LOCALE=DIR]... [--dump-responses F] [--config-file F]\n",
+    std::fprintf(stderr, "usage: %s LIBRARY PACK_DIR file.wav... [--clips LIST] [--jsonl F] [--dump-dir D] [--verbose] [--ime] [--realtime] [--speed X] [--simulate-realtime] [--chunk-ms N] [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]... [--update-context] [--context-name NAME] [--multilang LOCALE=DIR]... [--dump-responses F] [--config-file F]\n",
                  argv[0]);
     return 2;
   }
@@ -419,6 +425,8 @@ int main(int argc, char** argv) {
       o.ime = true;
     } else if (a == "--realtime") {
       o.speed = 1;
+    } else if (a == "--simulate-realtime") {
+      o.simulate_realtime = true;
     } else if (a == "--verbose") {
       o.verbose = true;
     } else if (a == "--chunk-ms" && has_value) {

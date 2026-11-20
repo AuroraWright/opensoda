@@ -3,6 +3,7 @@
 #include "soda_api.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -80,11 +81,13 @@ class SodaSession {
   bool Init(const std::string& config) {
     soda::RecognizerOptions o;
     int mode = kIme;
+    bool simulate_realtime = false;
     soda::ProtoReader r(config);
     while (r.Next()) {
       switch (r.field()) {
         case 1: o.channel_count = static_cast<int>(r.varint()); break;
         case 2: o.sample_rate = static_cast<int>(r.varint()); break;
+        case 5: simulate_realtime = r.varint() != 0; break;  // simulate_realtime_testonly
         case 7: o.language_pack_dir = r.str(); break;
         case 8: mode = static_cast<int>(r.varint()); break;
         case 11: o.enable_language_id |= r.varint() != 0; break;  // enable_lang_id
@@ -117,6 +120,13 @@ class SodaSession {
     // the config it loads), which RecognizerOptions picks by default; the
     // mode only selects the recognition domain.
     o.domain = mode == kCaption ? "CAPTION" : "IME";
+    // Fed faster than it recognizes, libsoda skips audio to keep up (see
+    // max_backlog_ms), keeping more with multilang_config, where a language
+    // switch rewinds (max_restream_duration_for_multilang_ms). With
+    // simulate_realtime_testonly it reads the audio at real-time speed
+    // instead, never falling behind; opensoda then recognizes all of it as
+    // fast as it can.
+    o.max_backlog_ms = simulate_realtime ? 0 : multilang_ ? 5000 : 1000;
     std::string error;
     recognizer_ = soda::Recognizer::Create(o, &error);
     if (!recognizer_) return false;
@@ -134,6 +144,7 @@ class SodaSession {
     Command c{Command::kAudio, {}};
     c.audio.resize(size / 2);
     std::memcpy(c.audio.data(), data, c.audio.size() * 2);
+    queued_frames_ += static_cast<int64_t>(c.audio.size()) / channels_;
     Post(std::move(c));
   }
   void Start() { Post({Command::kStart, {}}); }
@@ -201,6 +212,7 @@ class SodaSession {
       }
       switch (c.type) {
         case Command::kAudio:
+          queued_frames_ -= static_cast<int64_t>(c.audio.size()) / channels_;
           if (audio_start_usec_ == 0) audio_start_usec_ = NowUsec();
           recognizer_->AddAudio(c.audio.data(), c.audio.size());
           FinishSwitch();
@@ -229,6 +241,7 @@ class SodaSession {
 
   void Wire(soda::Recognizer* r) {
     r->set_callback([this](const soda::RecognitionEvent& e) { SendRecognition(e); });
+    r->set_queued_audio_callback([this] { return queued_frames_.load(); });
     r->set_audio_level_callback([this](const soda::AudioLevelEvent& e) { SendAudioLevel(e); });
     r->set_endpoint_callback([this](const soda::EndpointEvent& e) {
       SendEndpoint(e.type == soda::EndpointEvent::kStartOfSpeech ? kStartOfSpeechEvent
@@ -400,6 +413,7 @@ class SodaSession {
   std::unique_ptr<soda::Recognizer> next_recognizer_;  // A pending switch.
   std::string next_language_;
   int64_t audio_start_usec_ = 0;
+  std::atomic<int64_t> queued_frames_{0};  // Audio posted but not yet recognized.
   std::thread worker_;
   std::mutex mu_;
   std::condition_variable cv_;

@@ -54,7 +54,11 @@ tests/corpus.py compare libsoda.jsonl ours.jsonl --show 10
 Each output line holds a clip's finals (formatted text, the hypothesis Chrome's
 captions use, and raw text, with start and end times) and their concatenation. Chrome
 feeds libsoda in real time, which `run` does by default for any library
-but opensoda (whose results do not depend on the feed speed). The reference
+but opensoda (whose results do not depend on the feed speed). Fed faster,
+both libraries skip audio to keep up as with a live stream, so unpaced
+runs set `simulate_realtime_testonly` (`soda_api_client
+--simulate-realtime`): opensoda then recognizes all the audio as fast as it
+can, and libsoda at real-time speed. `regress.py` does the same. The reference
 library has to be one that works outside Chrome: Chrome's own copy
 of libsoda sends no results there.
 

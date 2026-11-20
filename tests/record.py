@@ -8,8 +8,8 @@ writes the responses to tests/data/<recording>/<reference>.bin, where
 tests/regress.py reads them. Existing references are kept unless --force.
 
 libsoda's output depends on how fast it is fed: its encoder batches frames
-as its threads keep up, and it skips audio when it falls more than 30 s
-behind. Recording at --speed 1 (the default; real time, as Chrome feeds
+as its threads keep up, and it skips audio when it falls behind.
+Recording at --speed 1 (the default; real time, as Chrome feeds
 it) takes as long as the audio.
 """
 

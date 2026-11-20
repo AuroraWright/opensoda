@@ -56,6 +56,7 @@ not what Chrome runs.
 | Language identification | `configs/LANGUAGE_IDENTIFICATION.config`, `langid/*`, `acousticmodel/SODA_DICTATION_EP_UNIFIED_FRONTEND_LANGID.*` | A separate pipeline: greco's automatic gain control, 32 ms log-mel frames, its own VAD and segmenter, then the streaming classifier (79 outputs, 47 mapped languages). Each output gives the top language and a confidence level from greco's scoring (probability margin and negentropy against two thresholds) |
 | Language switching | `multilang_config` packs | As in libsoda: the first highly confident (level 3) language identification of another language whose pack the config lists switches to that pack (`SWITCH_SUCCEEDED`), and a language without one is reported as `SWITCH_SKIPPED_NO_LP`. The language identifier has one class for several locales, and libsoda's table of them (`es-us` for es-ES, `cmn-hans-cn` for cmn-Hant-TW, `en-us` for en-GB, ...) decides both: `es-us` in an es-ES session is the current language, and `es-us` switches to an es-ES pack. The new pack's recognizer takes over the audio history and the language identifier and recognizes again from the last final (`rewind_when_switching_language`), so the sentence that triggered the switch is recognized in the new language. On a recording switching ja-JP → en-US → ja-JP, the switches, the finals and their boundaries match libsoda's, to a VAD frame |
 | Contextual biasing (en-US) | `endtoendmodel/large.wpm.portable`, config `class_substitution_twiddler` | Phrases from `recognition_context` or `UpdateRecognitionContext` are split into word pieces with the pack's byte-pair word-piece model (piece ids give the merge order) and built into a prefix trie with failure links, as libsoda's FST twiddler does. Both passes consult it: each matching piece lowers the cost by the phrase's boost plus `grammar_token_base_weight` (libsoda's token generator, with `BOOST_STRATEGY_PER_TOKEN_CONSTANT` spread uniformly over the pieces), a partial match that breaks off gives its reward back, a completed phrase keeps it, and going on after one costs `retwiddle_penalty`. As in greco's `DualSearchParams`, the label-cost limit and the pruning look at the cheaper of the biased and unbiased costs (`use_min_of_original_and_influenced_cost_for_pruning`), and the second pass biases no label costlier than `max_model_cost_to_influence`. |
+| Keeping up with live audio | | As in libsoda, which keeps captions close to live audio rather than falling ever further behind: each final starts a new recognition session, and a session that finds more than 1 s of received audio not yet recognized (5 s with a `multilang_config`, libsoda's `max_restream_duration_for_multilang_ms`) skips all but the last second (or 5 s) of it. Fed in real time, recognition is never that far behind; fed a file as fast as possible, both libraries recognize the first sentence and the last seconds, at the same points. With `simulate_realtime_testonly` (field 5) libsoda reads the audio at real-time speed, and opensoda recognizes all of it as fast as it can. libsoda still sends the speech events for skipped audio (its endpointer runs ahead of its recognizer); opensoda's restarts at the skip |
 | C API | `include/soda_api.h` | The entry points, protos and threading model that Chrome uses |
 
 ### Verified against Google's libsoda in Chrome
@@ -343,8 +344,8 @@ Apple silicon Mac, with the same audio, fed at real time as Chrome does:
 | en-US, 55 s | 4.9 s | 6.4 s | 179 MB | 233 MB |
 | ja-JP, 122 s | 14.9 s | 20.0 s | 241 MB | 268 MB |
 
-Fed faster (opensoda as fast as it goes, libsoda at 8x, since it skips
-audio it cannot keep up with), opensoda takes 3.2 s of CPU for en-US,
+Fed faster (opensoda as fast as it goes with `simulate_realtime_testonly`,
+libsoda at 8x, at which it keeps up), opensoda takes 3.2 s of CPU for en-US,
 10.9 s for ja-JP and 1.7 s for 25 s of pl-PL, against libsoda's 4.4 s,
 14.6 s and 2.4 s, and finishes the 122 s ja-JP recording in 11 s. Each
 model runs on one thread: the encoder takes a few frames at a time, and a
@@ -384,8 +385,9 @@ This produces:
 - `soda_transcribe`: transcribes a WAV file.
 - `soda_api_client`: drives any libsoda-compatible library (this one or
   Google's) through the C API, the same way Chrome does. `--speed X` paces the
-  audio at X times real time (Google's libsoda keeps 30 s of audio and skips
-  ahead when fed faster than it can process), `--dump-responses F` saves
+  audio at X times real time (unpaced, both libraries skip audio to keep up,
+  unless `--simulate-realtime` sets `simulate_realtime_testonly`),
+  `--dump-responses F` saves
   every raw response, `--multilang LOCALE=DIR` lists another installed pack
   for language switching, and `--phrase TEXT[:BOOST]` sends a biasing
   phrase (in the config, or with `UpdateRecognitionContext` after start
@@ -433,6 +435,9 @@ Load `libsoda.dylib` with `dlopen` and use it exactly as Chrome uses
    - `language_pack_directory` (7): the `SODAModels` path
    - `recognition_mode` (8): 2 = CAPTION, 1 = IME
    - `enable_formatting` (12): punctuation on or off
+   - `simulate_realtime_testonly` (5): for audio from a file, fed faster
+     than real time. Without it, recognition skips audio it is behind on,
+     as with a live stream (see above)
    - `mask_offensive_words` (16): masks offensive words with asterisks
    - `multilang_config` (15): `{1: {1: locale, 2: SODAModels path}, ...}`,
      one entry per installed pack, as Chrome sends it. It turns on language

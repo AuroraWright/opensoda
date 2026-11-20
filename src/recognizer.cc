@@ -369,7 +369,7 @@ void Recognizer::Reset() {
   ResetCascade();
   if (langid_) langid_->Reset();
   history_.clear();
-  history_start_ = origin_ = 0;
+  history_start_ = origin_ = skip_to_ = 0;
   restart_at_ = -1;
   frame_ends_ms_.clear();
   decoded_end_ms_ = 0;
@@ -466,6 +466,12 @@ void Recognizer::AddAudioFloat(const float* samples, size_t count) {
       history_.erase(history_.begin(), history_.begin() + drop);
       history_start_ += drop;
     }
+    // A restart skipped ahead past some of this audio.
+    const int64_t start = history_start_ + static_cast<int64_t>(history_.size() - count);
+    const size_t skip = static_cast<size_t>(std::clamp<int64_t>(skip_to_ - start, 0, count));
+    samples += skip;
+    count -= skip;
+    if (count == 0) return;
   }
   Process(samples, count);
 }
@@ -516,12 +522,24 @@ void Recognizer::Process(const float* samples, size_t count) {
 }
 
 void Recognizer::Restart() {
-  const int64_t from = std::max(restart_at_, history_start_);
+  int64_t from = std::max(restart_at_, history_start_);
   restart_at_ = -1;
+  const int64_t end = history_start_ + static_cast<int64_t>(history_.size());
+  if (options_.max_backlog_ms > 0) {
+    // libsoda's recognizer reads its audio from a pipe the input fills. A
+    // new session (each final starts one) with more than the limit unread
+    // in the pipe skips all but the limit's worth, moving its start on.
+    const int64_t queued = queued_audio_ ? queued_audio_() * kModelSampleRate / options_.sample_rate : 0;
+    const int64_t skip = end + queued - from - int64_t{options_.max_backlog_ms} * kModelSampleRate / 1000;
+    if (skip > 0) {
+      from += skip;
+      decoded_end_ms_ = segment_start_ms_ = last_final_end_ms_ = from * 1000 / kModelSampleRate;
+    }
+  }
+  skip_to_ = from;
   ResetPipeline();
   encoder_.Reset();
   origin_ = from;
-  const int64_t end = history_start_ + static_cast<int64_t>(history_.size());
   if (from >= end) return;
   std::vector<std::vector<float>> frames;
   std::vector<float> audio(history_.begin() + (from - history_start_), history_.end());
@@ -601,7 +619,7 @@ void Recognizer::Finish() {
   backlog_ = 0;
   decoded_end_ms_ = segment_start_ms_ = last_final_end_ms_ = 0;
   history_.clear();
-  history_start_ = origin_ = 0;
+  history_start_ = origin_ = skip_to_ = 0;
 }
 
 void Recognizer::ContinueFrom(Recognizer* previous) {
@@ -610,6 +628,7 @@ void Recognizer::ContinueFrom(Recognizer* previous) {
   }
   history_ = std::move(previous->history_);
   history_start_ = previous->history_start_;
+  skip_to_ = previous->skip_to_;
   resample_pos_ = previous->resample_pos_;
   resample_history_ = previous->resample_history_;
   level_power_ = previous->level_power_;

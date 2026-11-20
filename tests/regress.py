@@ -4,7 +4,8 @@
   tests/regress.py [-j N] [--check | --update] [CASE...]
 
 Each case runs build/soda_api_client on its recording with build/libsoda.dylib
-(as fast as it goes) and scores the responses against the case's reference:
+(as fast as it goes, simulating real time so that it does not skip audio to
+keep up) and scores the responses against the case's reference:
 
   partials   libsoda's distinct partial texts that opensoda also sends
   finals     finals with the same text, in order
@@ -123,6 +124,8 @@ def run_case(args, case, out_dir):
     out = os.path.join(out_dir, name + ".bin")
     cmd = [os.path.join(ROOT, "build", "soda_api_client"), args.library, pack, wav, *opts,
            "--speed", str(args.speed), "--dump-responses", out]
+    if args.speed == 0:
+        cmd.append("--simulate-realtime")
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode:
         return name, None, "soda_api_client failed (%d): %s" % (p.returncode, p.stderr[-500:])
