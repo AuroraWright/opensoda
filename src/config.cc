@@ -49,6 +49,8 @@ constexpr uint32_t kDecoderParams = 19583231;
 constexpr uint32_t kFstDecoderParams = 41039125;            // In DecoderParams.
 constexpr uint32_t kPieRnnFstDecoderParams = 194955910;     // In DecoderParams.
 constexpr uint32_t kTfliteTransducerParams = 213412442;     // In PieRnnFst...
+constexpr uint32_t kTfLiteModelResourceParams = 234621089;
+constexpr uint32_t kSpeakerTurnStreamParams = 301915449;
 
 struct Def {
   std::string name;
@@ -459,6 +461,116 @@ bool LoadLangIdConfig(const std::string& path, LangIdConfig* config,
   if (config->model_file.empty() || config->application_params_file.empty() ||
       config->vad.model_file.empty()) {
     *error = "language identification config lacks its model files";
+    return false;
+  }
+  return true;
+}
+
+bool LoadSpeakerTurnConfig(const std::string& path, SpeakerTurnConfig* config,
+                           std::string* error) {
+  std::vector<Def> streams;
+  std::map<std::string, Def> resources;
+  if (!ReadPipeline(path, &streams, &resources, error)) return false;
+  auto resource_params = [&](const std::string& ref) -> std::string_view {
+    auto it = resources.find(ref);
+    return it == resources.end() ? std::string_view() : it->second.params;
+  };
+  auto filename = [&](const std::string& ref, uint32_t ext) {
+    return FirstString(FindExtension(resource_params(ref), ext), 1);
+  };
+  FrontendConfig& fe = config->frontend;
+  fe.stack2 = {0, 0, 0, false, 1};
+  fe.cluster_id = -1;
+  std::map<std::string, std::string> refs;
+  std::string encoder_ref, mean_stddev_ref, vad_model_ref, vad_mean_stddev_ref;
+  for (const Def& s : streams) {
+    std::vector<std::string_view> params{s.params};
+    for (const auto& ref : s.params_refs) params.push_back(resource_params(ref));
+    for (std::string_view p : params) {
+      if (s.classname == "Framer") {
+        ParseFramer(FindExtension(p, kFramerParams), &fe);
+      } else if (s.classname == "Window") {
+        ParseWindow(FindExtension(p, kWindowParams), &fe);
+      } else if (s.classname == "Fft") {
+        ParseFft(FindExtension(p, kFftParams), &fe);
+      } else if (s.classname == "FilterBank") {
+        if (auto fb = FindExtension(p, kFilterBankParams); !fb.empty()) ParseFilterBank(fb, &fe);
+        if (auto fft = FindExtension(p, kFftParams); !fft.empty()) ParseFft(fft, &fe);
+      }
+    }
+    if (s.classname == "AutoGainControl") {
+      ParseAgc(FindExtension(s.params, kAutoGainControlParams), &config->agc);
+    } else if (s.classname == "FrameStacker") {
+      ParseFrameStacker(FindExtension(s.params, kFrameStackerParams), &fe.stack1);
+      fe.stack1.subsample = 1;
+    } else if (s.classname == "SubsampleStream") {
+      fe.stack1.subsample = ParseSubsample(FindExtension(s.params, kSubsampleParams));
+    } else if (s.classname == "AppendClusterIdStream") {
+      ProtoReader c(FindExtension(s.params, kAppendClusterIdParams));
+      bool one_hot = false;
+      int clusters = 0;
+      while (c.Next()) {
+        if (c.field() == 1) config->vad.cluster_id = static_cast<int>(c.int64());
+        if (c.field() == 2) one_hot = c.boolean();
+        if (c.field() == 3) clusters = static_cast<int>(c.int64());
+      }
+      config->vad.num_clusters = one_hot ? clusters : 0;
+    } else if (s.classname == "LstmComputeStream") {
+      ParseLstmCompute(FindExtension(s.params, kLstmComputeParams), &config->vad,
+                       &vad_model_ref, &vad_mean_stddev_ref);
+    } else if (s.classname == "EndpointerStream") {
+      ParseEndpointer(FindExtension(s.params, kEndpointerParams), &config->vad.endpointer);
+    } else if (s.classname == "SegmenterStream") {
+      ProtoReader g(FindExtension(s.params, kSegmenterParams));
+      while (g.Next()) {
+        if (g.field() == 3) config->reset_interval_ms = static_cast<int>(g.int64());
+        if (g.field() == 4) config->vad.impatience_start_ms = static_cast<int>(g.int64());
+        if (g.field() == 5) config->vad.impatience_limit_ms = static_cast<int>(g.int64());
+      }
+    } else if (s.classname == "TFliteRunStream") {
+      ProtoReader r(FindExtension(s.params, kTfliteRunStreamParams));
+      while (r.Next()) {
+        switch (r.field()) {
+          case 1: encoder_ref = r.str(); break;
+          case 11: config->initial_activations_ignored = static_cast<int>(r.int64()); break;
+          case 12: config->frame_batch_size = static_cast<int>(r.int64()); break;
+          case 15: mean_stddev_ref = r.str(); break;
+          case 16: config->last_frame_repetitions = static_cast<int>(r.int64()); break;
+        }
+      }
+    } else if (s.classname == "Decoder2Stream") {
+      std::string_view dp = FindExtension(s.params, kDecoderParams);
+      ParseDecoderParams(dp, &config->decoder, &refs);
+      refs["symbols"] = FirstString(dp, 3);
+      // FstDecoderParams.search_params (10) is inline here.
+      ProtoReader f(FindExtension(dp, kFstDecoderParams));
+      while (f.Next()) {
+        if (f.field() == 10) ParseSearchParams(f.bytes(), &config->decoder);
+      }
+    } else if (s.classname == "SpeakerTurnStream") {
+      ProtoReader r(FindExtension(s.params, kSpeakerTurnStreamParams));
+      while (r.Next()) {
+        switch (r.field()) {
+          case 1: config->speaker_change_id = static_cast<int>(r.int64()); break;
+          case 2: config->time_offset_ms = static_cast<int>(r.int64()); break;
+          case 3: config->max_speaker_segment_ms = static_cast<int>(r.int64()); break;
+          case 4: config->context_labels = static_cast<int>(r.int64()); break;
+          case 5: config->short_responses_to_ignore.push_back(r.str()); break;
+        }
+      }
+    }
+  }
+  config->vad.model_file = filename(vad_model_ref, kNeuralNetworkParams);
+  config->vad.mean_stddev_file = filename(vad_mean_stddev_ref, kProtoParams);
+  config->encoder_file = filename(encoder_ref, kTfLiteModelResourceParams);
+  config->mean_stddev_file = filename(mean_stddev_ref, kProtoParams);
+  config->decoder_file = filename(refs["decoder"], kTfLiteSessionParams);
+  config->joint_file = filename(refs["joint"], kTfLiteSessionParams);
+  config->symbols_file = filename(refs["symbols"], kSymbolTableParams);
+  if (config->encoder_file.empty() || config->mean_stddev_file.empty() ||
+      config->decoder_file.empty() || config->joint_file.empty() ||
+      config->symbols_file.empty() || config->speaker_change_id <= 0) {
+    *error = "speaker turn config " + path + " lacks its models";
     return false;
   }
   return true;

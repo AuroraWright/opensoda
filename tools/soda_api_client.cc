@@ -5,6 +5,7 @@
 //                        [--speed X] [--simulate-realtime] [--chunk-ms N] [--multilang LOCALE=DIR]...
 //                        [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]...
 //                        [--config-file F] [--update-context] [--context-name NAME]
+//                        [--no-multilang] [--speaker-change]
 //
 // --realtime paces the audio like a live microphone; --speed X paces it X
 // times faster. Unpaced, the libraries skip audio to keep up as with a live
@@ -35,6 +36,10 @@
 // --dump-responses F writes every response to F as {f64 time, u64 handle,
 // u32 size, bytes} (read by tests/soda_dump.py); with several clips,
 // --dump-dir D writes D/<clip number>.bin for each (from 00000.bin).
+//
+// --no-multilang leaves out the multilang config Chrome sends (libsoda then
+// holds back each final's unfinished sentence); --speaker-change sets
+// enable_speaker_change_detection, which libsoda only honors without one.
 //
 // --update-context sends the --phrase list with UpdateRecognitionContext
 // after ExtendedSodaStart instead of in the config. --context-name names the
@@ -166,7 +171,6 @@ void OnEvent(const char* data, int size, void* handle) {
     if (s->print) std::printf("FINAL(reason=%d): %s\n", reason, f.text.c_str());
     std::lock_guard<std::mutex> lock(s->mu);
     s->finals.push_back(std::move(f));
-    if (reason == 3) s->done = true;
   } else {
     if (s->print) std::printf("  partial: %s\n", f.text.c_str());
     std::lock_guard<std::mutex> lock(s->mu);
@@ -244,6 +248,7 @@ struct Options {
   std::string pack;
   bool ime = false, format = true, mask = false, update_context = false, verbose = false;
   bool simulate_realtime = false;
+  bool multilang = true, speaker_change = false;
   double speed = 0;  // 0: as fast as possible.
   double clip_timeout_s = 30;  // After the audio is fed; 0: none.
   int chunk_ms = 100;
@@ -276,6 +281,7 @@ std::string BuildConfig(const Options& o, int rate, int channels, std::string* c
     cfg.Varint(8, o.ime ? 1 : 2);
     cfg.Bool(12, o.format);  // enable_formatting
     if (o.mask) cfg.Bool(16, true);  // mask_offensive_words
+    if (o.speaker_change) cfg.Bool(13, true);  // enable_speaker_change_detection
     // Chrome also sends a multi-language config mapping the language to its
     // pack ({1: map<language, pack dir>, 2: 1}), listing every installed pack;
     // --multilang adds more.
@@ -296,7 +302,7 @@ std::string BuildConfig(const Options& o, int rate, int channels, std::string* c
       multi.Bytes(1, entry.data());
     }
     multi.Varint(2, 1);  // rewind_when_switching_language
-    cfg.Bytes(15, multi.data());
+    if (o.multilang) cfg.Bytes(15, multi.data());
   }
   if (!o.phrases.empty()) {
     // recognition_context (19), as Chrome's Web Speech API sends it.
@@ -358,8 +364,8 @@ bool RunClip(const Library& lib, const Options& o, const std::vector<char>& pcm,
     }
   }
   lib.mark_done(soda);
-  // Wait for STOP or the end-of-audio final, or for the event stream to go
-  // quiet.
+  // Wait for STOP, or for the event stream to go quiet. (libsoda can send
+  // the end-of-audio endpoint after the end-of-audio final.)
   s->last_event_ms = NowMs();
   while (!s->done && NowMs() - s->last_event_ms < 3000) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -404,7 +410,7 @@ class Watchdog {
 
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::fprintf(stderr, "usage: %s LIBRARY PACK_DIR file.wav... [--clips LIST] [--jsonl F] [--dump-dir D] [--verbose] [--ime] [--realtime] [--speed X] [--simulate-realtime] [--chunk-ms N] [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]... [--update-context] [--context-name NAME] [--multilang LOCALE=DIR]... [--dump-responses F] [--config-file F]\n",
+    std::fprintf(stderr, "usage: %s LIBRARY PACK_DIR file.wav... [--clips LIST] [--jsonl F] [--dump-dir D] [--verbose] [--ime] [--realtime] [--speed X] [--simulate-realtime] [--chunk-ms N] [--no-format] [--mask-offensive] [--api-key KEY] [--phrase TEXT[:BOOST]]... [--update-context] [--context-name NAME] [--multilang LOCALE=DIR]... [--no-multilang] [--speaker-change] [--dump-responses F] [--config-file F]\n",
                  argv[0]);
     return 2;
   }
@@ -441,6 +447,10 @@ int main(int argc, char** argv) {
       o.update_context = true;
     } else if (a == "--mask-offensive") {
       o.mask = true;
+    } else if (a == "--no-multilang") {
+      o.multilang = false;
+    } else if (a == "--speaker-change") {
+      o.speaker_change = true;
     } else if (a == "--api-key" && has_value) {
       o.api_key = argv[++i];
     } else if (a == "--config-file" && has_value) {

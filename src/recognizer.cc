@@ -185,6 +185,15 @@ bool Recognizer::Init(const RecognizerOptions& options, std::string* error) {
     langid_ = LanguageIdentifier::Create(models, error);
     if (!langid_) return false;
   }
+  if (options.speaker_change_detection) {
+    // Like libsoda, recognize without it where the pack has no model.
+    std::string ignored;
+    speaker_turns_ = SpeakerTurnDetector::Create(models, &ignored);
+    if (speaker_turns_ && config_.vad.impatience_limit_ms > 0) {
+      config_.vad.impatience_start_ms = 15000;
+      config_.vad.impatience_limit_ms = 30000;
+    }
+  }
   // Words are written with spaces when the punctuation settings segment text
   // by whitespace (BasicTextSegmenterConfig field 3 = SIMPLE_WHITESPACE) rather
   // than by character (ja-JP).
@@ -262,18 +271,8 @@ bool Recognizer::Init(const RecognizerOptions& options, std::string* error) {
   }
 
   auto search_options = [&](const DecoderConfig& d) {
-    BeamSearchOptions bo;
-    bo.max_arcs = options.beam > 0 ? options.beam : d.max_arcs;
-    bo.min_arcs = d.min_arcs;
-    bo.local_beam = d.local_beam;
-    bo.histogram_scale = d.histogram_scale;
-    bo.histogram_buckets = d.histogram_buckets;
-    bo.word_pen = d.word_pen;
-    bo.max_label_cost = d.max_model_cost;
-    bo.max_expansions = std::max(1, d.max_expansions);
-    bo.temperature = d.smoothing_temperature;
-    bo.max_model_cost_to_influence = d.max_model_cost_to_influence;
-    bo.prune_on_min_cost = d.prune_on_min_cost;
+    BeamSearchOptions bo = SearchOptions(d);
+    if (options.beam > 0) bo.max_arcs = options.beam;
     return bo;
   };
   search_ = std::make_unique<BeamSearch>(&decoder_, &joint_, search_options(config_.decoder),
@@ -320,6 +319,10 @@ bool Recognizer::Init(const RecognizerOptions& options, std::string* error) {
       }
     }
   }
+  // libsoda's text formatter holds sentences back only when it formats
+  // (not without punctuation, nor in th-TH, which has no model), and results
+  // end at endpoints.
+  holding_ = options.hold_unfinished_sentences && punctuator_ && vad_;
   Reset();
   return true;
 }
@@ -368,6 +371,8 @@ void Recognizer::Reset() {
   search_->Reset();
   ResetCascade();
   if (langid_) langid_->Reset();
+  if (speaker_turns_) speaker_turns_->Reset();
+  speaker_turns_from_ms_ = 0;
   history_.clear();
   history_start_ = origin_ = skip_to_ = 0;
   restart_at_ = -1;
@@ -375,6 +380,9 @@ void Recognizer::Reset() {
   decoded_end_ms_ = 0;
   segment_start_ms_ = last_final_end_ms_ = 0;
   last_partial_.clear();
+  held_.clear();
+  held_since_ms_ = -1;
+  formatter_end_ms_ = 0;
   had_final_ = false;
   speech_started_ = session_started_ = false;
   last_endpoint_ms_ = -1;
@@ -452,6 +460,7 @@ void Recognizer::AddAudioFloat(const float* samples, size_t count) {
     count = resampled.size();
   }
   if (langid_) langid_->Accept(samples, count);
+  if (speaker_turns_) speaker_turns_->Accept(samples, count);
   if (vad_) {
     // libsoda measures the 48 kHz resampler's output before rounding.
     if (unrounded.empty()) {
@@ -471,9 +480,23 @@ void Recognizer::AddAudioFloat(const float* samples, size_t count) {
     const size_t skip = static_cast<size_t>(std::clamp<int64_t>(skip_to_ - start, 0, count));
     samples += skip;
     count -= skip;
-    if (count == 0) return;
   }
-  Process(samples, count);
+  if (count > 0) Process(samples, count);
+  if (holding_) CheckHeld();
+}
+
+int64_t Recognizer::AudioMs() const {
+  return (history_start_ + static_cast<int64_t>(history_.size())) * 1000 / kModelSampleRate;
+}
+
+void Recognizer::CheckHeld() {
+  // libsoda times this on the wall clock, from when the final reached its
+  // formatter, checking at each of its pipeline's events.
+  if (held_.empty() || held_since_ms_ < 0 || AudioMs() - held_since_ms_ <= 3000) return;
+  RecognitionEvent e;
+  e.type = RecognitionEvent::kFinal;
+  e.spaced_words = spaced_words_;
+  EmitHolding(&e, 0, /*force=*/true);
 }
 
 void Recognizer::ReportLevels(const float* samples, size_t count, double scale) {
@@ -579,6 +602,7 @@ void Recognizer::Finish() {
     if (restart_at_ < 0) break;
   }
   if (langid_) langid_->Finish();
+  if (speaker_turns_) speaker_turns_->Finish();
   // libsoda ends the stream a VAD frame before the end of the last one, and
   // sends that before the final of a segment the audio ends in.
   if (vad_) {
@@ -612,6 +636,8 @@ void Recognizer::Finish() {
   endpointer_.Reset();
   vad_frontend_.Reset();
   if (langid_) langid_->Reset();
+  if (speaker_turns_) speaker_turns_->Reset();
+  speaker_turns_from_ms_ = 0;
   decoder_.ClearCache();
   if (cascade_) decoder2_.ClearCache();
   vad_frames_ = decided_frames_ = segment_first_frame_ = 0;
@@ -883,6 +909,36 @@ void Recognizer::Describe(const Hypothesis& h, bool final, RecognitionEvent* e) 
 
 void Recognizer::Describe(const Hypothesis& h, bool final, const std::vector<int64_t>& frame_ends_ms,
                           RecognitionEvent* e) const {
+  DescribeWords(h, final, frame_ends_ms, e);
+  Format(final, final, e);
+}
+
+std::string Recognizer::JoinRaw(const std::vector<WordTiming>& words, bool final) const {
+  std::string text;
+  for (size_t i = 0; i < words.size(); ++i) {
+    const WordTiming& w = words[i];
+    const bool glue = character_partials_ && (!final || w.joined);
+    if (i > 0 && !glue && !GlueWords(words[i - 1].raw_text, w.raw_text)) text += ' ';
+    text += w.raw_text;
+  }
+  return text;
+}
+
+int64_t Recognizer::LastWordEnd(const Hypothesis& h, const std::vector<int64_t>& frame_ends_ms) const {
+  // As word starts are timed (see DescribeWords).
+  for (size_t i = h.labels.size(); i-- > 0;) {
+    const int id = h.labels[i];
+    if (id <= 0 || id >= symbols_.size() || frame_ends_ms.empty()) continue;
+    const std::string& s = symbols_.Symbol(id);
+    if (s == kWordBoundary || (s.size() > 2 && s.front() == '<' && s.back() == '>')) continue;
+    const size_t f = std::min<size_t>(h.label_frames[i], frame_ends_ms.size() - 1);
+    return std::max<int64_t>(segment_start_ms_, frame_ends_ms[f] - static_cast<int64_t>(frame_ms_));
+  }
+  return decoded_end_ms_;
+}
+
+void Recognizer::DescribeWords(const Hypothesis& h, bool final, const std::vector<int64_t>& frame_ends_ms,
+                               RecognitionEvent* e) const {
   e->spaced_words = spaced_words_;
   e->raw_text = LabelsToText(h.labels);
   // Words start at pieces carrying the boundary marker.
@@ -930,15 +986,7 @@ void Recognizer::Describe(const Hypothesis& h, bool final, const std::vector<int
   // In packs punctuated by character (ja-JP, cmn-*), libsoda's raw text has
   // no spaces in partials (`テスト@GmailCO`), and in finals none before a
   // word that began at a bare word boundary; elsewhere the scripts decide.
-  auto rejoin = [this, e, final] {
-    e->raw_text.clear();
-    for (size_t i = 0; i < e->words.size(); ++i) {
-      const WordTiming& w = e->words[i];
-      const bool glue = character_partials_ && (!final || w.joined);
-      if (i > 0 && !glue && !GlueWords(e->words[i - 1].raw_text, w.raw_text)) e->raw_text += ' ';
-      e->raw_text += w.raw_text;
-    }
-  };
+  auto rejoin = [this, e, final] { e->raw_text = JoinRaw(e->words, final); };
   if (character_partials_ && !e->words.empty()) rejoin();
   // The config's denormalizer list fixes the order: grammars listed before
   // the capitalization normalizer see the words before truecasing.
@@ -980,9 +1028,19 @@ void Recognizer::Describe(const Hypothesis& h, bool final, const std::vector<int
       }
     }
   }
-  std::vector<std::string> words;
-  for (const auto& w : e->words) words.push_back(w.raw_text);
-  if (punctuator_) punctuator_->Punctuate(&words, final);
+}
+
+void Recognizer::Format(bool final, bool trailing_mark, RecognitionEvent* e, size_t count,
+                        std::vector<bool>* sentence_ends, size_t first) const {
+  std::vector<std::string> words, model_words;
+  for (const auto& w : e->words) {
+    words.push_back(w.raw_text);
+    const size_t marks = w.marks_before + w.marks_after;
+    model_words.push_back(marks < w.raw_text.size()
+                              ? w.raw_text.substr(w.marks_before, w.raw_text.size() - marks)
+                              : w.raw_text);
+  }
+  if (punctuator_) punctuator_->Punctuate(&words, trailing_mark, sentence_ends, &model_words);
   // libsoda masks last, over the punctuated words joined by spaces; the
   // grammar only matches whole words.
   if (masker_ && !words.empty()) {
@@ -999,6 +1057,14 @@ void Recognizer::Describe(const Hypothesis& h, bool final, const std::vector<int
     } else {
       for (auto& w : words) w = masker_->Apply(w);
     }
+  }
+  if (count < words.size() || first > 0) {
+    count = std::min(count, words.size());
+    words.erase(words.begin() + count, words.end());
+    words.erase(words.begin(), words.begin() + std::min(first, count));
+    e->words.erase(e->words.begin() + count, e->words.end());
+    e->words.erase(e->words.begin(), e->words.begin() + std::min(first, count));
+    e->raw_text = JoinRaw(e->words, final);
   }
   for (size_t i = 0; i < words.size(); ++i) {
     e->words[i].text = words[i];
@@ -1106,8 +1172,39 @@ void Recognizer::DenormalizeText(bool final, const std::vector<const TextNormali
   std::string text;
   for (const auto& w : *words) text += (text.empty() ? "" : " ") + w.raw_text;
   const std::string before = text;
-  for (const auto* d : normalizers) text = d->Apply(text);
+  // As libsoda formats them, closing marks join the word before and opening
+  // brackets the word after.
+  auto only = [](const std::string& t, const char* set) {
+    return !t.empty() && t.find_first_not_of(set) == std::string::npos;
+  };
+  auto is_mark = [&](const std::string& t) { return only(t, ",.?!;:%)]}") || only(t, "([{"); };
+  // The text before the grammars that only take out spaces (the last one
+  // joins dictated marks to their words, "Hello ," to "Hello,"): libsoda
+  // keeps those marks apart from the words its punctuation model sees.
+  auto no_spaces = [](std::string s) {
+    s.erase(std::remove(s.begin(), s.end(), ' '), s.end());
+    return s;
+  };
+  std::string split;
+  for (const auto* d : normalizers) {
+    std::string next = d->Apply(text);
+    if (next != text) {
+      if (no_spaces(next) != no_spaces(text)) split.clear();
+      else if (split.empty()) split = text;
+    }
+    text = std::move(next);
+  }
   if (text == before) return;
+  // Which of the text's bytes are of a token of marks in `split`.
+  std::vector<bool> mark(text.size(), false);
+  for (size_t i = 0, s = 0; !split.empty() && i < text.size(); ++i) {
+    if (text[i] == ' ') continue;
+    while (split[s] == ' ') ++s;
+    const size_t a = split.rfind(' ', s), b = std::min(split.find(' ', s), split.size());
+    const size_t from = a == std::string::npos ? 0 : a + 1;
+    mark[i] = is_mark(split.substr(from, b - from));
+    ++s;
+  }
   // libsoda drops a paragraph or line break ("{new-paragraph}" in
   // dictation) and capitalizes the next word. A final drops the spaces
   // around it too, joining the words; a partial keeps one.
@@ -1118,12 +1215,20 @@ void Recognizer::DenormalizeText(bool final, const std::vector<const TextNormali
     if (b < text.size() && text[b] >= 'a' && text[b] <= 'z') text[b] = static_cast<char>(text[b] - 'a' + 'A');
     const bool space = !final && a > 0 && b < text.size();
     text.replace(a, b - a, space ? " " : "");
+    mark.erase(mark.begin() + a, mark.begin() + b);
+    if (space) mark.insert(mark.begin() + a, false);
     i = a + space;
   }
   std::vector<std::string> tokens;
+  std::vector<std::pair<size_t, size_t>> token_marks;  // Mark bytes at each token's start and end.
   for (size_t i = 0, j; i <= text.size(); i = j + 1) {
     j = std::min(text.find(' ', i), text.size());
-    if (j > i) tokens.push_back(text.substr(i, j - i));
+    if (j <= i) continue;
+    tokens.push_back(text.substr(i, j - i));
+    size_t f = i, l = j;
+    while (f < j && mark[f]) ++f;
+    while (l > f && mark[l - 1]) --l;
+    token_marks.emplace_back(f - i, j - l);
   }
   // Word starts carry over through the longest common subsequence of the
   // words. Between kept words, as many new words as replaced ones take
@@ -1162,11 +1267,6 @@ void Recognizer::DenormalizeText(bool final, const std::vector<const TextNormali
     }
   }
   fill_gap(n, m);
-  // As libsoda formats them, closing marks join the word before and opening
-  // brackets the word after.
-  auto only = [](const std::string& t, const char* set) {
-    return !t.empty() && t.find_first_not_of(set) == std::string::npos;
-  };
   std::vector<WordTiming> out;
   std::string prefix;
   for (size_t j = 0; j < m; ++j) {
@@ -1177,17 +1277,24 @@ void Recognizer::DenormalizeText(bool final, const std::vector<const TextNormali
     }
     if (!out.empty() && only(t, ",.?!;:%)]}")) {
       out.back().raw_text += prefix + t;
+      out.back().marks_after += prefix.size() + t.size();
     } else {
       out.push_back({});
       out.back().raw_text = prefix + t;
+      out.back().marks_before = prefix.size() + token_marks[j].first;
+      out.back().marks_after = token_marks[j].second;
       out.back().start_ms = starts[j];
       out.back().joined = joined[j];
     }
     prefix.clear();
   }
   if (!prefix.empty()) {
-    if (out.empty()) out.push_back({prefix, prefix, words->front().start_ms});
-    else out.back().raw_text += prefix;
+    if (out.empty()) {
+      out.push_back({prefix, prefix, words->front().start_ms});
+    } else {
+      out.back().raw_text += prefix;
+      out.back().marks_after += prefix.size();
+    }
   }
   *words = std::move(out);
 }
@@ -1202,12 +1309,44 @@ void Recognizer::EmitPartial() {
   if (!callback_) return;
   RecognitionEvent e;
   e.type = RecognitionEvent::kPartial;
-  Describe(search_->Best(), /*final=*/false, &e);
-  if (Blank(e.raw_text) || e.spaced_text == last_partial_) return;
+  DescribeWords(search_->Best(), /*final=*/false, frame_ends_ms_, &e);
+  if (Blank(e.raw_text)) return;
+  // Held words lead the partial, and it stops the clock on sending them.
+  held_since_ms_ = -1;
+  const size_t held = held_.size();
+  if (held > 0) {
+    e.words.insert(e.words.begin(), held_.begin(), held_.end());
+    e.raw_text = JoinRaw(e.words, /*final=*/false);
+  }
+  const RecognitionEvent words = e;
+  std::vector<bool> sentence_ends;
+  Format(/*final=*/false, /*trailing_mark=*/false, &e, std::string::npos, &sentence_ends);
+  // Punctuated together with the partial's words, the held ones may now end
+  // a sentence: libsoda's formatter then sends them up to the last such end
+  // among them as a final, which ends where the next word starts ("I did."
+  // once "we have a table ... great" follows), and the partial goes on from
+  // there.
+  size_t count = 0;
+  for (size_t i = 1; i < held; ++i) {
+    if (sentence_ends[i - 1]) count = i;
+  }
+  if (count > 0) {
+    RecognitionEvent f = words;
+    f.type = RecognitionEvent::kFinal;
+    Format(/*final=*/true, /*trailing_mark=*/false, &f, count);
+    f.start_ms = held_.front().start_ms;
+    f.end_ms = held_[count].start_ms;
+    held_.erase(held_.begin(), held_.begin() + count);
+    SendFinal(&f, &e);
+    e = words;
+    Format(/*final=*/false, /*trailing_mark=*/false, &e, std::string::npos, nullptr, count);
+  }
+  if (e.spaced_text == last_partial_) return;
   last_partial_ = e.spaced_text;
   e.leading_space = spaced_words_ && had_final_;
   SetWordConfidence(&e);
-  e.start_ms = segment_start_ms_;
+  MarkSpeakerChanges(&e);
+  e.start_ms = held_.empty() ? segment_start_ms_ : held_.front().start_ms;
   // libsoda's partials end a frame before ours.
   e.end_ms = std::max<int64_t>(segment_start_ms_, decoded_end_ms_ - static_cast<int64_t>(frame_ms_));
   callback_(e);
@@ -1230,6 +1369,36 @@ void Recognizer::SetWordConfidence(RecognitionEvent* e) const {
   }
 }
 
+void Recognizer::MarkSpeakerChanges(RecognitionEvent* e, const RecognitionEvent* all) const {
+  if (!speaker_turns_ || e->words.empty()) return;
+  std::vector<SpeakerTurn> turns;
+  for (SpeakerTurn& t : speaker_turns_->Turns()) {
+    if (t.time_ms > speaker_turns_from_ms_) turns.push_back(std::move(t));
+  }
+  if (turns.empty()) return;
+  // libsoda places them among all the parts its formatter has, so a turn
+  // goes to a held word ("Sunday instead. \n – Sounds") rather than into the
+  // words it sends.
+  std::vector<SpeakerTurnWord> words;
+  for (const WordTiming& w : (all ? all : e)->words) {
+    words.push_back({w.text, w.raw_text, w.start_ms, words.empty() ? e->leading_space : spaced_words_});
+  }
+  const std::vector<bool> change = PlaceSpeakerTurns(turns, words);
+  // libsoda starts each new speaker's words on a line of their own, after a
+  // dash, in the formatted text only.
+  size_t pos = 0;
+  for (size_t i = 0; i < e->words.size(); ++i) {
+    const size_t at = e->spaced_text.find(e->words[i].text, pos);
+    if (at == std::string::npos) break;
+    pos = at + e->words[i].text.size();
+    if (!change[i]) continue;
+    e->words[i].speaker_change = true;
+    static const std::string kMark = "\n \xE2\x80\x93 ";  // "\n – "
+    e->spaced_text.insert(at, kMark);
+    pos += kMark.size();
+  }
+}
+
 void Recognizer::EmitFinal(bool end_of_audio, bool segment_end) {
   if (segment_end) {
     // The result ends at the last encoder frame boundary before the segment
@@ -1242,24 +1411,27 @@ void Recognizer::EmitFinal(bool end_of_audio, bool segment_end) {
   }
   RecognitionEvent e;
   e.type = RecognitionEvent::kFinal;
-  if (cascade_) {
-    // Finals come from the second pass.
-    FlushCascade();
-    Describe(search2_->Best(), /*final=*/true, frame_ends2_ms_, &e);
+  e.end_of_audio = end_of_audio;
+  // Finals come from the second pass, if there is one.
+  if (cascade_) FlushCascade();
+  const Hypothesis& best = cascade_ ? search2_->Best() : search_->Best();
+  const std::vector<int64_t>& frame_ends = cascade_ ? frame_ends2_ms_ : frame_ends_ms_;
+  DescribeWords(best, /*final=*/true, frame_ends, &e);
+  if (holding_) {
+    if (callback_ && (!Blank(e.raw_text) || end_of_audio)) {
+      EmitHolding(&e, LastWordEnd(best, frame_ends), /*force=*/end_of_audio);
+    }
   } else {
-    Describe(search_->Best(), /*final=*/true, &e);
-  }
-  if (callback_ && (!Blank(e.raw_text) || end_of_audio)) {
-    e.end_of_audio = end_of_audio;
-    // Like libsoda, a result starts at its first word (usually where the
-    // previous one ended) and ends at its segment's end.
-    e.start_ms = segment_start_ms_;
-    e.end_ms = decoded_end_ms_;
-    if (!e.words.empty()) e.start_ms = std::max(e.start_ms, e.words.front().start_ms);
-    e.leading_space = spaced_words_ && had_final_;
-    SetWordConfidence(&e);
-    had_final_ |= !Blank(e.raw_text);
-    callback_(e);
+    Format(/*final=*/true, /*trailing_mark=*/true, &e);
+    if (callback_ && (!Blank(e.raw_text) || end_of_audio)) {
+      // Like libsoda, a result starts at its first word (usually where the
+      // previous one ended) and ends at its segment's end.
+      e.start_ms = segment_start_ms_;
+      e.end_ms = decoded_end_ms_;
+      if (!e.words.empty()) e.start_ms = std::max(e.start_ms, e.words.front().start_ms);
+      SendFinal(&e);
+    }
+    speaker_turns_from_ms_ = decoded_end_ms_;
   }
   // A restart at a segment end starts the search afresh too (measured
   // against libsoda on the lesson recording: 19% vs 27% with the decoder
@@ -1273,6 +1445,76 @@ void Recognizer::EmitFinal(bool end_of_audio, bool segment_end) {
   segment_start_ms_ = last_final_end_ms_ = decoded_end_ms_;
   frame_ends_ms_.clear();
   last_partial_.clear();
+}
+
+void Recognizer::SendFinal(RecognitionEvent* e, const RecognitionEvent* all) {
+  e->leading_space = spaced_words_ && had_final_;
+  SetWordConfidence(e);
+  MarkSpeakerChanges(e, all);
+  had_final_ |= !Blank(e->raw_text);
+  speaker_turns_from_ms_ = e->end_ms;
+  callback_(*e);
+}
+
+void Recognizer::EmitHolding(RecognitionEvent* e, int64_t new_words_end_ms, bool force) {
+  // libsoda's TextFormatter keeps a final's words (its "parts") and formats
+  // them with those it holds; it sends the parts up to the last one after
+  // the end of a sentence, and holds the rest.
+  const size_t held = held_.size();
+  const bool added = !e->words.empty();
+  if (added) {
+    // The formatter's clock runs from the last final with words, and a
+    // final it sends whole ends where that one did.
+    formatter_end_ms_ = decoded_end_ms_;
+    held_since_ms_ = AudioMs();
+  }
+  if (held > 0) {
+    e->words.insert(e->words.begin(), held_.begin(), held_.end());
+    e->raw_text = JoinRaw(e->words, /*final=*/true);
+  }
+  if (e->words.empty()) {
+    // A blank final at the end of the audio, as without holding.
+    Format(/*final=*/true, /*trailing_mark=*/true, e);
+    e->start_ms = segment_start_ms_;
+    e->end_ms = decoded_end_ms_;
+    SendFinal(e);
+    return;
+  }
+  const RecognitionEvent words = *e;
+  const size_t n = words.words.size();
+  // Unless forced, the words are punctuated as a partial's: the last one
+  // never ends a sentence. A sentence ends where the model predicted its
+  // mark ("5:00 p.m. Tomorrow" when it put a period after "p.m.", but not
+  // "8:00 a.m. And", where the period is only the abbreviation's).
+  std::vector<bool> sentence_ends;
+  Format(/*final=*/true, /*trailing_mark=*/force, e, std::string::npos, &sentence_ends);
+  size_t count = n;
+  if (!force) {
+    count = 0;
+    for (size_t i = 1; i < n; ++i) {
+      if (sentence_ends[i - 1]) count = i;
+    }
+  }
+  // The result ends where its last word does: where the next word starts,
+  // or for the last held word, where its result's last label was.
+  int64_t end_ms = formatter_end_ms_;
+  if (count > 0 && count < n) end_ms = count == held ? held_end_ms_ : words.words[count].start_ms;
+  // With speaker change detection, libsoda's diarization ends a result
+  // sent whole at its last word too.
+  if (count == n && speaker_turns_) end_ms = added ? new_words_end_ms : held_end_ms_;
+  held_.assign(words.words.begin() + count, words.words.end());
+  if (added) held_end_ms_ = new_words_end_ms;
+  if (held_.empty()) held_since_ms_ = -1;
+  if (count == 0) return;
+  const RecognitionEvent all = *e;
+  if (count < n) {
+    *e = words;
+    Format(/*final=*/true, /*trailing_mark=*/false, e, count);
+  }
+  e->start_ms = e->words.front().start_ms;
+  if (held == 0) e->start_ms = std::max(e->start_ms, segment_start_ms_);
+  e->end_ms = end_ms;
+  SendFinal(e, &all);
 }
 
 }  // namespace soda

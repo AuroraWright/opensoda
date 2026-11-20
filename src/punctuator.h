@@ -40,7 +40,13 @@ class Punctuator {
   // as the pack's SODA_punctuation_config.pb says for ja-JP), the model sees
   // one token per character, so a mark may land inside a word. For a partial
   // result (`final` false), no mark follows the last character.
-  void Punctuate(std::vector<std::string>* words, bool final);
+  // `sentence_ends`, if given, receives for each word whether the model
+  // predicted an end-of-sentence mark after it (even where the word already
+  // had a mark, which then stays as it is). `model_words`, if given, are
+  // the words as a Roadrunner model sees them (without dictated marks).
+  void Punctuate(std::vector<std::string>* words, bool final,
+                 std::vector<bool>* sentence_ends = nullptr,
+                 const std::vector<std::string>* model_words = nullptr);
 
   // Returns, for each model token, the punctuation to append ("" for none).
   // If `scores` is given, it receives each token's class probabilities, in
@@ -63,7 +69,10 @@ class Punctuator {
 
   // Roadrunner models (RoadrunnerPunctuationNormalizerParams).
   void Capitalize(std::vector<std::string>* words) const;
-  void PunctuateRoadrunner(std::vector<std::string>* words, bool final);
+  void PunctuateRoadrunner(std::vector<std::string>* words, bool final,
+                           std::vector<bool>* sentence_ends,
+                           const std::vector<std::string>* model_words);
+  bool IsSentenceEnd(const std::string& mark) const;
   std::vector<int> RoadrunnerLabels(const std::vector<std::string>& tokens);
   bool roadrunner_ = false;
   std::vector<std::string> codebook_;

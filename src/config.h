@@ -314,6 +314,36 @@ struct LangIdConfig {
 bool LoadLangIdConfig(const std::string& path, LangIdConfig* config,
                       std::string* error);
 
+// The ONDEVICE_SPEAKER_TURN_DETECTION pipeline: langid's front end, then a
+// streaming encoder and a character transducer whose output marks speaker
+// changes with a symbol of their own.
+struct SpeakerTurnConfig {
+  AgcConfig agc;
+  FrontendConfig frontend;  // stack1 gives the encoder's input frames.
+  VadConfig vad;            // With the segmenter's impatience.
+  // SegmenterParams.reset_interval_ms: silence that ends a segment.
+  int reset_interval_ms = 1000;
+  // TFliteRunStreamParams.
+  std::string encoder_file;      // Relative to SODAModels.
+  std::string mean_stddev_file;  // Normalizes the encoder's input.
+  int frame_batch_size = 1;
+  int initial_activations_ignored = 0;
+  int last_frame_repetitions = 0;  // Copies of the last frame at the end.
+  DecoderConfig decoder;
+  std::string decoder_file;
+  std::string joint_file;
+  std::string symbols_file;
+  // SpeakerTurnStreamParams.
+  int speaker_change_id = 0;
+  int time_offset_ms = 0;
+  int max_speaker_segment_ms = 0;
+  int context_labels = 0;
+  std::vector<std::string> short_responses_to_ignore;
+};
+
+bool LoadSpeakerTurnConfig(const std::string& path, SpeakerTurnConfig* config,
+                           std::string* error);
+
 // Parses a greco.PipelineDef config. Returns false (with *error set) if the
 // file is unreadable or lacks the end-to-end model pieces.
 bool LoadPipelineConfig(const std::string& path, PipelineConfig* config,

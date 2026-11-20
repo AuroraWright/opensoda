@@ -19,6 +19,7 @@
 #include "spoken_punctuation.h"
 #include "fst_normalizer.h"
 #include "roadrunner_capitalizer.h"
+#include "speaker_turn.h"
 #include "truecaser.h"
 #include "symbol_table.h"
 #include "transducer.h"
@@ -68,6 +69,19 @@ struct RecognizerOptions {
   // skips to the last max_backlog_ms of it. libsoda keeps 1000 ms, or 5000 ms
   // with a multilang config. 0 recognizes all the audio, however late.
   int max_backlog_ms = 0;
+  // Mark the words where another speaker takes over, as libsoda's
+  // enable_speaker_change_detection does, with the pack's
+  // ONDEVICE_SPEAKER_TURN_DETECTION model (en-US packs; others ignore it).
+  // As in libsoda, segments are then cut after 30 s of speech, not 60.
+  bool speaker_change_detection = false;
+  // Hold back the unfinished sentence at the end of each final, as libsoda's
+  // text formatter does without a multilang_config's languages (with the
+  // VAD and punctuation on): a final ends after its last word that ends a
+  // sentence, punctuated as a partial is, and the words after it start the
+  // next partials and final. They are sent on their own, punctuated as a
+  // final, after 3 s of audio without a partial, and at the end of the
+  // audio.
+  bool hold_unfinished_sentences = false;
   // Phrases to bias recognition toward, with their boosts (packs with a
   // class_substitution_twiddler context model, such as en-US; others ignore
   // them).
@@ -84,6 +98,12 @@ struct WordTiming {
   bool joined = false;
   // SODA's AsrConfidence bucket: 0 (UNKNOWN) or 1 (LOW), as libsoda reports.
   int confidence = 0;
+  // Another speaker starts with this word (speaker_change_detection).
+  bool speaker_change = false;
+  // Bytes at the start and end of raw_text from marks of their own that
+  // joined it (dictated punctuation: "hello" and "," in "hello,"), which
+  // libsoda's punctuation model does not see.
+  size_t marks_before = 0, marks_after = 0;
 };
 
 struct RecognitionEvent {
@@ -218,11 +238,39 @@ class Recognizer {
                        std::vector<WordTiming>* words) const;
   // Fills in the words' confidence buckets.
   void SetWordConfidence(RecognitionEvent* e) const;
+  // Marks the words where the speaker changes, and the formatted text
+  // before them. The turns are placed among `all`'s words if given (the
+  // words a final is sent from, which start with `e`'s).
+  void MarkSpeakerChanges(RecognitionEvent* e, const RecognitionEvent* all = nullptr) const;
   // Fills `e` (text forms and words) from a hypothesis, whose label frames
   // end at `frame_ends_ms` (by default, the first pass's).
   void Describe(const Hypothesis& h, bool final, RecognitionEvent* e) const;
   void Describe(const Hypothesis& h, bool final, const std::vector<int64_t>& frame_ends_ms,
                 RecognitionEvent* e) const;
+  // Describe's two steps: the words, normalized but not yet punctuated, and
+  // the raw text; then the punctuated words and text forms (`trailing_mark`:
+  // punctuating after the last word too, as for a final), of the first
+  // `count` words only if given and from word `first` (punctuated in the
+  // context of all of them). `sentence_ends` receives which words the
+  // punctuation model ended a sentence after.
+  void DescribeWords(const Hypothesis& h, bool final, const std::vector<int64_t>& frame_ends_ms,
+                     RecognitionEvent* e) const;
+  void Format(bool final, bool trailing_mark, RecognitionEvent* e,
+              size_t count = std::string::npos, std::vector<bool>* sentence_ends = nullptr,
+              size_t first = 0) const;
+  // The raw text of words, spaced as Describe's.
+  std::string JoinRaw(const std::vector<WordTiming>& words, bool final) const;
+  // The start of the frame where the hypothesis's last word ended.
+  int64_t LastWordEnd(const Hypothesis& h, const std::vector<int64_t>& frame_ends_ms) const;
+  // hold_unfinished_sentences: emits a final from the held words and `e`'s
+  // (when `force`, all of them), and holds back the rest.
+  void EmitHolding(RecognitionEvent* e, int64_t new_words_end_ms, bool force);
+  // Sends a final's event with the fields every final gets (`all` as for
+  // MarkSpeakerChanges).
+  void SendFinal(RecognitionEvent* e, const RecognitionEvent* all = nullptr);
+  // Sends the held words if a final left them more than 3 s ago.
+  void CheckHeld();
+  int64_t AudioMs() const;
   // Feeds first-pass frames through the cascaded encoder to the second pass
   // (`flush`: the segment is closed).
   void RunCascade(bool flush);
@@ -268,6 +316,9 @@ class Recognizer {
   bool keep_class_tags_ = false;
   std::unique_ptr<VoiceActivityDetector> vad_;  // Null when disabled or absent.
   std::unique_ptr<LanguageIdentifier> langid_;  // Null unless enabled.
+  std::unique_ptr<SpeakerTurnDetector> speaker_turns_;  // Likewise.
+  // The end of the last final: older speaker turns are no longer placed.
+  int64_t speaker_turns_from_ms_ = 0;
   Endpointer endpointer_;
   std::vector<std::vector<float>> vad_input_;  // Frames tapped from frontend_.
   // With config_.vad.spectral_noise, the VAD's input comes from the FFT
@@ -311,6 +362,14 @@ class Recognizer {
   int64_t segment_start_ms_ = 0;
   int64_t last_final_end_ms_ = 0;  // Where the last final ended.
   std::string last_partial_;
+  // hold_unfinished_sentences: the words held back, not punctuated, the end
+  // of the last one, the audio time of the final that left them (until a
+  // partial, -1), and the end of the last final with words.
+  bool holding_ = false;
+  std::vector<WordTiming> held_;
+  int64_t held_end_ms_ = 0;
+  int64_t held_since_ms_ = -1;
+  int64_t formatter_end_ms_ = 0;
   float frame_ms_ = 60.0f;
   // Whether the language separates words by spaces (the punctuation
   // config's separate_words_by_space): its partials list words rather than

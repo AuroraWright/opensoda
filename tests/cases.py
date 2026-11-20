@@ -47,6 +47,13 @@ CASES = [
     ("en4_ime", "en4", "ime", "en-US", IME),
     ("en5", "en5", "caption", "en-US", []),
     ("en5_ime", "en5", "ime", "en-US", IME),
+    # Without a multilang config (Chrome always sends one), finals hold back
+    # an unfinished last sentence. dialog is a two-voice conversation, also
+    # with speaker change detection.
+    ("en_hold", "en_bench", "caption_nomulti", "en-US", ["--no-multilang"]),
+    ("en3_ime_hold", "en3", "ime_nomulti", "en-US", IME + ["--no-multilang"]),
+    ("dialog", "dialog", "caption_nomulti", "en-US", ["--no-multilang"]),
+    ("dialog_scd", "dialog", "speaker", "en-US", ["--no-multilang", "--speaker-change"]),
     # Contextual biasing toward five rare names, at boosts 1 and 3.
     ("b1", "bias", "boost1", "en-US", phrases(1)),
     ("b3", "bias", "boost3", "en-US", phrases(3)),

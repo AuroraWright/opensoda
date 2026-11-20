@@ -166,11 +166,16 @@ bool PredictionNetwork::Init(const std::string& path, int num_threads,
                              std::string* error) {
   if (!model_.Load(path, num_threads, error)) return false;
   tflite::Interpreter* interp = model_.interpreter();
-  if (interp->inputs().size() != 2 || interp->AllocateTensors() != kTfLiteOk) {
+  const size_t inputs = interp->inputs().size();
+  recurrent_ = inputs > 2;
+  if (inputs < 2 || (recurrent_ && interp->outputs().size() != inputs) ||
+      interp->AllocateTensors() != kTfLiteOk) {
     *error = "unexpected prediction network signature";
     return false;
   }
-  output_dim_ = Dim(interp->tensor(interp->outputs()[0]), 1);
+  const TfLiteTensor* out = interp->tensor(interp->outputs()[0]);
+  output_dim_ = Dim(out, out->dims->size - 1);
+  batch_ = recurrent_ ? Dim(interp->tensor(interp->inputs()[0]), 0) : 1;
   return true;
 }
 
@@ -187,18 +192,69 @@ const std::vector<float>& PredictionNetwork::Get(int prev_label, int label) {
   return cache_.emplace(key, std::vector<float>(o, o + output_dim_)).first->second;
 }
 
+void PredictionNetwork::Outputs(std::vector<Hypothesis>& hyps,
+                                std::vector<const std::vector<float>*>* out) {
+  out->clear();
+  if (!recurrent_) {
+    for (const Hypothesis& h : hyps) out->push_back(&Get(h.prev_label, h.last_label));
+    return;
+  }
+  tflite::Interpreter* interp = model_.interpreter();
+  const auto& inputs = interp->inputs();
+  const auto& outputs = interp->outputs();
+  std::vector<Hypothesis*> todo;
+  for (Hypothesis& h : hyps) {
+    if (!h.decoder_state) todo.push_back(&h);
+  }
+  // Rows are independent; unused rows of a batch repeat the first.
+  for (size_t b = 0; b < todo.size(); b += batch_) {
+    const size_t n = std::min(todo.size() - b, static_cast<size_t>(batch_));
+    for (int row = 0; row < batch_; ++row) {
+      const Hypothesis& h = *todo[b + (row < static_cast<int>(n) ? row : 0)];
+      interp->typed_tensor<int32_t>(inputs[0])[row] = h.last_label;
+      for (size_t i = 1; i < inputs.size(); ++i) {
+        TfLiteTensor* t = interp->tensor(inputs[i]);
+        const size_t dim = t->bytes / sizeof(float) / batch_;
+        float* dst = t->data.f + row * dim;
+        if (h.parent_state) {
+          std::memcpy(dst, h.parent_state->states[i - 1].data(), dim * sizeof(float));
+        } else {
+          std::fill(dst, dst + dim, 0.0f);
+        }
+      }
+    }
+    interp->Invoke();
+    for (size_t row = 0; row < n; ++row) {
+      auto state = std::make_shared<DecoderState>();
+      const float* o = interp->tensor(outputs[0])->data.f + row * output_dim_;
+      state->output.assign(o, o + output_dim_);
+      for (size_t i = 1; i < outputs.size(); ++i) {
+        const TfLiteTensor* t = interp->tensor(outputs[i]);
+        const size_t dim = t->bytes / sizeof(float) / batch_;
+        state->states.emplace_back(t->data.f + row * dim, t->data.f + (row + 1) * dim);
+      }
+      todo[b + row]->decoder_state = std::move(state);
+    }
+  }
+  for (const Hypothesis& h : hyps) out->push_back(&h.decoder_state->output);
+}
+
 bool JointNetwork::Init(const std::string& path, int num_threads,
-                        std::string* error) {
+                        std::string* error, bool logits) {
   if (!model_.Load(path, num_threads, error)) return false;
+  logits_ = logits;
   tflite::Interpreter* interp = model_.interpreter();
   if (interp->inputs().size() != 2 || interp->AllocateTensors() != kTfLiteOk) {
     *error = "unexpected joint network signature";
     return false;
   }
-  encoder_dim_ = Dim(interp->tensor(interp->inputs()[0]), 1);
-  decoder_dim_ = Dim(interp->tensor(interp->inputs()[1]), 1);
+  const TfLiteTensor* enc = interp->tensor(interp->inputs()[0]);
+  rank3_ = enc->dims->size == 3;
+  encoder_dim_ = Dim(enc, enc->dims->size - 1);
+  const TfLiteTensor* dec = interp->tensor(interp->inputs()[1]);
+  decoder_dim_ = Dim(dec, dec->dims->size - 1);
   output_dim_ = Dim(interp->tensor(interp->outputs()[0]), 1);
-  batch_ = 1;
+  batch_ = rank3_ ? Dim(dec, 0) : 1;
   return true;
 }
 
@@ -207,6 +263,25 @@ void JointNetwork::Run(const float* encoder_frame,
                        std::vector<float>* probs) {
   tflite::Interpreter* interp = model_.interpreter();
   const int b = static_cast<int>(decoder_outputs.size());
+  if (rank3_) {
+    // A fixed batch of decoder outputs against one encoder frame; unused
+    // rows repeat the first.
+    float* enc = interp->typed_tensor<float>(interp->inputs()[0]);
+    float* dec = interp->typed_tensor<float>(interp->inputs()[1]);
+    std::memcpy(enc, encoder_frame, encoder_dim_ * sizeof(float));
+    probs->resize(static_cast<size_t>(b) * output_dim_);
+    for (int start = 0; start < b; start += batch_) {
+      const int n = std::min(batch_, b - start);
+      for (int i = 0; i < batch_; ++i) {
+        std::memcpy(dec + i * decoder_dim_, decoder_outputs[start + (i < n ? i : 0)]->data(),
+                    decoder_dim_ * sizeof(float));
+      }
+      interp->Invoke();
+      const float* o = interp->typed_tensor<float>(interp->outputs()[0]);
+      std::copy(o, o + n * output_dim_, probs->data() + start * output_dim_);
+    }
+    return;
+  }
   if (b != batch_) {
     interp->ResizeInputTensor(interp->inputs()[0], {b, encoder_dim_});
     interp->ResizeInputTensor(interp->inputs()[1], {b, decoder_dim_});
@@ -223,6 +298,22 @@ void JointNetwork::Run(const float* encoder_frame,
   interp->Invoke();
   const float* o = interp->typed_tensor<float>(interp->outputs()[0]);
   probs->assign(o, o + b * output_dim_);
+}
+
+BeamSearchOptions SearchOptions(const DecoderConfig& d) {
+  BeamSearchOptions bo;
+  bo.max_arcs = d.max_arcs;
+  bo.min_arcs = d.min_arcs;
+  bo.local_beam = d.local_beam;
+  bo.histogram_scale = d.histogram_scale;
+  bo.histogram_buckets = d.histogram_buckets;
+  bo.word_pen = d.word_pen;
+  bo.max_label_cost = d.max_model_cost;
+  bo.max_expansions = std::max(1, d.max_expansions);
+  bo.temperature = d.smoothing_temperature;
+  bo.max_model_cost_to_influence = d.max_model_cost_to_influence;
+  bo.prune_on_min_cost = d.prune_on_min_cost;
+  return bo;
 }
 
 BeamSearch::BeamSearch(PredictionNetwork* decoder, JointNetwork* joint,
@@ -248,6 +339,7 @@ void BeamSearch::Resume() {
   const Hypothesis& best = Best();
   h.prev_label = best.prev_label;
   h.last_label = best.last_label;
+  h.decoder_state = best.decoder_state;
   beam_.assign(1, h);
   ended_.clear();
   best_ = 0;
@@ -256,13 +348,12 @@ void BeamSearch::Resume() {
 }
 
 void BeamSearch::Score(const std::vector<float>& encoder_frame,
-                       const std::vector<Hypothesis>& hyps,
+                       std::vector<Hypothesis>& hyps,
                        std::vector<std::vector<float>>* costs) {
   const int vocab = joint_->output_dim();
   const float inv_temp = 1.0f / options_.temperature;
   std::vector<const std::vector<float>*> dec;
-  dec.reserve(hyps.size());
-  for (const Hypothesis& h : hyps) dec.push_back(&decoder_->Get(h.prev_label, h.last_label));
+  decoder_->Outputs(hyps, &dec);
   joint_->Run(encoder_frame.data(), dec, &probs_);
   costs->resize(hyps.size());
   for (size_t i = 0; i < hyps.size(); ++i) {
@@ -272,7 +363,7 @@ void BeamSearch::Score(const std::vector<float>& encoder_frame,
     c.resize(vocab);
     float norm = -std::numeric_limits<float>::infinity();
     for (int k = 0; k < vocab; ++k) {
-      c[k] = std::log(std::max(p[k], 1e-30f)) * inv_temp;
+      c[k] = (joint_->logits() ? p[k] : std::log(std::max(p[k], 1e-30f))) * inv_temp;
       norm = LogAdd(norm, c[k]);
     }
     for (int k = 0; k < vocab; ++k) c[k] = norm - c[k];
@@ -379,6 +470,8 @@ void BeamSearch::Advance(const std::vector<float>& encoder_frame) {
         e.label_frames.push_back(frame_);
         e.prev_label = h.last_label;
         e.last_label = k;
+        e.decoder_state = nullptr;
+        e.parent_state = h.decoder_state;
         e.model_cost = (h.model_cost + cost) + options_.word_pen;
         e.cost = (h.cost + cost) + options_.word_pen + bias;
         e.bias_state = bias_state;

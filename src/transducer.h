@@ -70,35 +70,11 @@ class StreamingEncoder {
   std::vector<State> states_;
 };
 
-class PredictionNetwork {
- public:
-  bool Init(const std::string& path, int num_threads, std::string* error);
-  // Output for `label` with `prev_label` as the decoder state. Cached.
-  const std::vector<float>& Get(int prev_label, int label);
-  int output_dim() const { return output_dim_; }
-  void ClearCache() { cache_.clear(); }
-
- private:
-  TfLiteModel model_;
-  int output_dim_ = 0;
-  std::unordered_map<uint64_t, std::vector<float>> cache_;
-};
-
-class JointNetwork {
- public:
-  bool Init(const std::string& path, int num_threads, std::string* error);
-  // Writes rows of output_dim() probabilities, one per decoder output.
-  void Run(const float* encoder_frame,
-           const std::vector<const std::vector<float>*>& decoder_outputs,
-           std::vector<float>* probs);
-  int output_dim() const { return output_dim_; }
-
- private:
-  TfLiteModel model_;
-  int encoder_dim_ = 0;
-  int decoder_dim_ = 0;
-  int output_dim_ = 0;
-  int batch_ = 0;
+// A recurrent prediction network's state after a hypothesis's labels, and
+// its output.
+struct DecoderState {
+  std::vector<float> output;
+  std::vector<std::vector<float>> states;
 };
 
 struct Hypothesis {
@@ -109,6 +85,58 @@ struct Hypothesis {
   int prev_label = 0;             // Decoder state: the label before last.
   int last_label = 0;
   int bias_state = 0;             // ContextBiaser state after the labels.
+  // Recurrent prediction networks: the state after last_label, computed
+  // when the hypothesis is first scored from the one before it (null:
+  // zeros).
+  std::shared_ptr<const DecoderState> decoder_state;
+  std::shared_ptr<const DecoderState> parent_state;
+};
+
+class PredictionNetwork {
+ public:
+  bool Init(const std::string& path, int num_threads, std::string* error);
+  // Output for `label` with `prev_label` as the decoder state. Cached.
+  const std::vector<float>& Get(int prev_label, int label);
+  // The output for a hypothesis's labels. Recurrent networks first compute
+  // the states the hypotheses lack.
+  void Outputs(std::vector<Hypothesis>& hyps, std::vector<const std::vector<float>*>* out);
+  int output_dim() const { return output_dim_; }
+  void ClearCache() { cache_.clear(); }
+
+ private:
+  TfLiteModel model_;
+  int output_dim_ = 0;
+  // A recurrent network (SODA_SPEAKER_TURN.scd.decoder) takes the label and
+  // its states and returns its output and the new states, input i + 1 being
+  // fed back from output i + 1, for a fixed batch of hypotheses.
+  bool recurrent_ = false;
+  int batch_ = 1;
+  std::unordered_map<uint64_t, std::vector<float>> cache_;
+};
+
+class JointNetwork {
+ public:
+  // `logits`: the network outputs logits rather than probabilities.
+  bool Init(const std::string& path, int num_threads, std::string* error,
+            bool logits = false);
+  // Writes rows of output_dim() probabilities (or logits), one per decoder
+  // output.
+  void Run(const float* encoder_frame,
+           const std::vector<const std::vector<float>*>& decoder_outputs,
+           std::vector<float>* probs);
+  int output_dim() const { return output_dim_; }
+  bool logits() const { return logits_; }
+
+ private:
+  TfLiteModel model_;
+  bool logits_ = false;
+  // Inputs of rank 3 ([1, 1, D] and [B, 1, D]): one encoder frame against
+  // a fixed batch of decoder outputs.
+  bool rank3_ = false;
+  int encoder_dim_ = 0;
+  int decoder_dim_ = 0;
+  int output_dim_ = 0;
+  int batch_ = 0;
 };
 
 struct BeamSearchOptions {
@@ -129,6 +157,8 @@ struct BeamSearchOptions {
   float max_model_cost_to_influence = 1e20f;
   bool prune_on_min_cost = false;
 };
+
+BeamSearchOptions SearchOptions(const DecoderConfig& d);
 
 // greco's breadth-first transducer search (speech/decoder2/dual,
 // BREADTH_FIRST strategy) over a graph that accepts any label sequence.
@@ -159,7 +189,7 @@ class BeamSearch {
 
  private:
   // Label costs for each hypothesis in `hyps` on this frame.
-  void Score(const std::vector<float>& encoder_frame, const std::vector<Hypothesis>& hyps,
+  void Score(const std::vector<float>& encoder_frame, std::vector<Hypothesis>& hyps,
              std::vector<std::vector<float>>* costs);
   // The pruning threshold from greco's ScoreHistogram for `hyps` relative to
   // `best`, starting from `threshold`.

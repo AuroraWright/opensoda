@@ -82,6 +82,7 @@ class SodaSession {
     soda::RecognizerOptions o;
     int mode = kIme;
     bool simulate_realtime = false;
+    bool speaker_change = false;
     soda::ProtoReader r(config);
     while (r.Next()) {
       switch (r.field()) {
@@ -111,11 +112,21 @@ class SodaSession {
           }
           break;
         }
+        case 13: speaker_change |= r.varint() != 0; break;  // enable_speaker_change_detection
         case 16: o.mask_offensive_words = r.varint() != 0; break;
+        // speaker_diarization_mode: SPEAKER_CHANGE_DETECTION (2) is the same.
+        case 17: speaker_change |= r.varint() == 2; break;
         case 19: o.phrases = ParseContext(r.bytes()); break;  // recognition_context
       }
     }
     if (o.language_pack_dir.empty()) return false;
+    // libsoda refuses speaker change detection with multilang languages
+    // (unless limited to one switch per session, which Chrome's
+    // MultilangConfig cannot ask for) and recognizes without it.
+    o.speaker_change_detection = speaker_change && packs_.empty();
+    // Without multilang languages, libsoda's text formatter holds back each
+    // final's unfinished sentence.
+    o.hold_unfinished_sentences = packs_.empty();
     // libsoda runs the pack's CONTINUOUS config in both modes (its log names
     // the config it loads), which RecognizerOptions picks by default; the
     // mode only selects the recognition domain.
@@ -367,21 +378,25 @@ class SodaSession {
     timing.Varint(4, e.end_ms * 1000);
     result.Message(4, timing);
     auto add_part = [&](const std::string& text, const std::string& raw, int64_t offset_ms,
-                        int confidence) {
+                        int confidence, bool speaker_change = false) {
       soda::ProtoWriter part;  // HypothesisPart
       part.Bytes(1, text);
       part.Bytes(1, raw);
       part.Varint(2, offset_ms);
+      if (speaker_change) part.Varint(3, 1);  // speaker_change
       part.Varint(5, confidence);  // word_confidence, written even when 0
       result.Message(5, part);
     };
     if (final) {
       for (const auto& word : e.words) {
-        add_part(word.text, word.raw_text, word.start_ms - e.start_ms, word.confidence);
+        add_part(word.text, word.raw_text, word.start_ms - e.start_ms, word.confidence,
+                 word.speaker_change);
       }
     } else if (e.spaced_words) {
       // In languages written with spaces, one part per word, at offset 0.
-      for (const auto& word : e.words) add_part(word.text, word.raw_text, 0, word.confidence);
+      for (const auto& word : e.words) {
+        add_part(word.text, word.raw_text, 0, word.confidence, word.speaker_change);
+      }
     } else {
       // Otherwise partials list one part per character, all at offset 0.
       for (size_t i = 0; i < e.raw_text.size();) {

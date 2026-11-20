@@ -521,9 +521,11 @@ std::vector<int> Punctuator::RoadrunnerLabels(const std::vector<std::string>& to
   return labels;
 }
 
-void Punctuator::PunctuateRoadrunner(std::vector<std::string>* words, bool final) {
+void Punctuator::PunctuateRoadrunner(std::vector<std::string>* words, bool final,
+                                     std::vector<bool>* sentence_ends,
+                                     const std::vector<std::string>* model_words) {
   std::vector<std::string> tokens;
-  for (const auto& w : *words) tokens.push_back(LowerCase(w));
+  for (const auto& w : model_words ? *model_words : *words) tokens.push_back(LowerCase(w));
   if (append_dummy_token_) tokens.emplace_back();
   const std::vector<int> labels = RoadrunnerLabels(tokens);
   // A label is the mark before its word: (label - 1) / 2 indexes the
@@ -534,6 +536,7 @@ void Punctuator::PunctuateRoadrunner(std::vector<std::string>* words, bool final
     if (k < 0 || k >= static_cast<int>(codebook_.size())) continue;
     const std::string& entry = codebook_[k];
     const std::string mark = entry.substr(entry.rfind('|') + 1);
+    if (sentence_ends) (*sentence_ends)[i] = IsSentenceEnd(mark);
     std::string& word = (*words)[i];
     // libsoda leaves a word that already ends with a mark of the codebook
     // (checked in codebook order, up to its first empty entry) as it is.
@@ -649,9 +652,18 @@ void Punctuator::Capitalize(std::vector<std::string>* words) const {
   }
 }
 
-void Punctuator::Punctuate(std::vector<std::string>* words, bool final) {
+bool Punctuator::IsSentenceEnd(const std::string& mark) const {
+  return !mark.empty() &&
+         std::find(end_of_sentence_marks_.begin(), end_of_sentence_marks_.end(), mark) !=
+             end_of_sentence_marks_.end();
+}
+
+void Punctuator::Punctuate(std::vector<std::string>* words, bool final,
+                           std::vector<bool>* sentence_ends,
+                           const std::vector<std::string>* model_words) {
+  if (sentence_ends) sentence_ends->assign(words->size(), false);
   if (roadrunner_) {
-    PunctuateRoadrunner(words, final);
+    PunctuateRoadrunner(words, final, sentence_ends, model_words);
     Capitalize(words);
     return;
   }
@@ -696,6 +708,10 @@ void Punctuator::Punctuate(std::vector<std::string>* words, bool final) {
   }
   std::vector<std::string> marks = Predict(tokens);
   if (!final && !marks.empty()) marks.back().clear();
+  // A word ends a sentence by the mark predicted after its last token.
+  for (size_t k = 0; sentence_ends && k < marks.size(); ++k) {
+    (*sentence_ends)[ends[k].first] = IsSentenceEnd(marks[k]);
+  }
   // Insert from the back so earlier offsets stay valid.
   for (size_t k = marks.size(); k-- > 0;) {
     if (marks[k].empty()) continue;

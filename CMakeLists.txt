@@ -86,6 +86,7 @@ add_library(opensoda_core STATIC
   src/language_packs.cc
   src/punctuator.cc
   src/roadrunner_capitalizer.cc
+  src/speaker_turn.cc
   src/spoken_punctuation.cc
   src/pqrnn_spoken_punctuation.cc
   src/unicode_case.cc
