@@ -393,6 +393,12 @@ These features work in libsoda, but only for requests Chrome never makes. They a
   prefetching (`enable_result_prefetch`, `EagerPrefetchingConfig`), which Chrome doesn't turn on. None of the 3,900
   results libsoda sent in the test runs was a prefetch result.
 
+### Not reproduced on purpose
+
+- **Google's DRM.** Google's libsoda only works inside Chrome. Loaded by any other application, it silences the audio
+  it's given, so it never returns a result. opensoda doesn't reproduce this (congrats Google for DRMing assistive
+  technologies!).
+
 ### Differences with no effect
 
 These parts of libsoda don't change the results for any request in these packs:
